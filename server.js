@@ -25,8 +25,13 @@ const User = mongoose.model('User', new mongoose.Schema({
   phone: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, enum: ['admin', 'group_leader', 'deputy_leader'], required: true },
-  group: { type: String, enum: ['A', 'B'], required: true }
+  role: { type: String, enum: ['admin', 'group_leader', 'deputy_leader'], default: 'group_leader' },
+  group: { 
+    type: String, 
+    enum: ['A', 'B'], 
+    required: true  // Changed to required for all
+  },
+  isAdmin: { type: Boolean, default: false }
 }));
 
 const Member = mongoose.model('Member', new mongoose.Schema({
@@ -85,6 +90,18 @@ const authenticate = (req, res, next) => {
   }
 };
 
+const authorizeAdmin = (req, res, next) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).send('Admin access required');
+  }
+  next();
+};
+
+// Use it like this in admin routes:
+app.get('/api/admin/members', authenticate, authorizeAdmin, async (req, res) => {
+  // Admin-only member listing
+});
+
 const authorize = (roles) => (req, res, next) => {
   if (!roles.includes(req.user.role)) {
     return res.status(403).send('Forbidden');
@@ -118,6 +135,18 @@ const authorize = (roles) => (req, res, next) => {
 
 //     await Member.insertMany([...groupAMembers, ...groupBMembers]);
 //   }
+
+  // if (await User.countDocuments({ isAdmin: true }) === 0) {
+  //   const hashedPassword = await bcrypt.hash('admin123', 10);
+  //   await User.create({
+  //     name: 'Super Admin',
+  //     email: 'admin@church.com',
+  //     password: hashedPassword,
+  //     phone: '00000000000',
+  //     isAdmin: true,
+  //     role: 'admin'
+  //   });
+  // }
 // };
 
 // Routes
@@ -162,31 +191,33 @@ app.post('/api/login', async (req, res) => {
   res.header('Authorization', token).send({ token, user });
 });
 
+// Get all members (admin can see all, others see only their group)
 app.get('/api/members', authenticate, async (req, res) => {
-  const members = await Member.find({ group: req.user.group });
-  res.send(members);
-});
-app.post('/api/members', [
-  authenticate,
-  authorize(['admin', 'group_leader']),
-  body('name').notEmpty().trim(),
-  body('phone').notEmpty().trim(),
-  body('group').isIn(['A', 'B'])
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
   try {
-    const member = new Member({
+    let query = {};
+    if (req.user.role !== 'admin') {
+      query.group = req.user.group;
+    }
+    
+    const members = await Member.find(query);
+    res.json(members);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+app.post('/api/members', authenticate, async (req, res) => {
+  try {
+    const memberData = {
       name: req.body.name,
       phone: req.body.phone,
       group: req.user.role === 'admin' ? req.body.group : req.user.group
-    });
+    };
     
+    const member = new Member(memberData);
     await member.save();
-    res.status(201).send(member);
+    res.status(201).json(member);
   } catch (err) {
-    res.status(400).send(err.message);
+    res.status(400).json({ message: err.message });
   }
 });
 
@@ -305,27 +336,126 @@ app.post('/api/reports/finalize', authenticate, authorize(['group_leader']), [
   }
 });
 
-app.get('/api/reports', authenticate, async (req, res) => {
+// In your server.js
+app.post('/api/reports', authenticate, async (req, res) => {
   try {
-    let query = {};
-    if (req.user.role !== 'admin') {
-      query.group = req.user.group;
+    const { month, year, contacts, isLeaderReport } = req.body;
+    const userId = req.user._id;
+    const group = req.user.group;
+
+    // Validate input
+    if (!month || !year || !contacts) {
+      return res.status(400).json({ message: 'Missing required fields' });
     }
 
-    if (req.query.month) query.month = req.query.month;
-    if (req.query.year) query.year = req.query.year;
+    // Find existing report or create new one
+    let report = await Report.findOne({ month, year, group });
 
-    const reports = await Report.find(query)
-      .populate('leaderReport.leaderId', 'name')
-      .populate('deputyReport.leaderId', 'name')
-      .populate('leaderReport.contacts.memberId', 'name phone')
-      .populate('deputyReport.contacts.memberId', 'name phone');
+    if (!report) {
+      report = new Report({
+        month,
+        year,
+        group,
+        leaderReport: { leaderId: userId, contacts: [] },
+        deputyReport: { leaderId: userId, contacts: [] }
+      });
+    }
 
-    res.send(reports);
+    // Update the appropriate report based on user role
+    if (isLeaderReport) {
+      report.leaderReport = {
+        leaderId: userId,
+        contacts: contacts.map(contact => ({
+          memberId: contact.memberId,
+          contacted: contact.contacted,
+          feedback: contact.feedback
+        })),
+        submittedAt: new Date()
+      };
+    } else {
+      report.deputyReport = {
+        leaderId: userId,
+        contacts: contacts.map(contact => ({
+          memberId: contact.memberId,
+          contacted: contact.contacted,
+          feedback: contact.feedback
+        })),
+        submittedAt: new Date()
+      };
+    }
+
+    // Automatically finalize if both reports are submitted
+    if (report.leaderReport.contacts.length > 0 && report.deputyReport.contacts.length > 0) {
+      report.finalSubmission = true;
+      report.submittedAt = new Date();
+    }
+
+    await report.save();
+    res.status(201).json(report);
   } catch (err) {
-    res.status(400).send(err.message);
+    res.status(500).json({ message: err.message });
   }
 });
+
+// Add this route to your backend
+app.post('/api/reports', authenticate, async (req, res) => {
+  try {
+    const { month, year, contacts } = req.body;
+    const userId = req.user._id;
+    const userRole = req.user.role;
+    const group = req.user.group;
+
+    // Validate input
+    if (!month || !year || !contacts) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Find existing report or create new one
+    let report = await Report.findOne({ month, year, group });
+
+    if (!report) {
+      report = new Report({
+        month,
+        year,
+        group,
+        leaderReport: { leaderId: userId, contacts: [] },
+        deputyReport: { leaderId: userId, contacts: [] }
+      });
+    }
+
+    // Update the appropriate report based on user role
+    if (userRole === 'group_leader') {
+      report.leaderReport = {
+        leaderId: userId,
+        contacts: contacts.map(contact => ({
+          memberId: contact.memberId,
+          contacted: contact.contacted,
+          feedback: contact.feedback
+        })),
+        submittedAt: new Date()
+      };
+    } else if (userRole === 'deputy_leader') {
+      report.deputyReport = {
+        leaderId: userId,
+        contacts: contacts.map(contact => ({
+          memberId: contact.memberId,
+          contacted: contact.contacted,
+          feedback: contact.feedback
+        })),
+        submittedAt: new Date()
+      };
+    } else {
+      return res.status(403).json({ message: 'Only leaders can submit reports' });
+    }
+
+    await report.save();
+    res.status(201).json(report);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+
 
 app.get('/api/reports/export', authenticate, authorize(['admin']), async (req, res) => {
   try {
@@ -392,6 +522,156 @@ app.get('/api/reports/export', authenticate, authorize(['admin']), async (req, r
   }
 });
 
+// Admin login
+app.post('/api/admin/login', async (req, res) => {
+  const user = await User.findOne({ email: req.body.email, isAdmin: true });
+  if (!user) return res.status(400).send('Admin not found');
+
+  const validPass = await bcrypt.compare(req.body.password, user.password);
+  if (!validPass) return res.status(400).send('Invalid password');
+
+  const token = jwt.sign(
+    { _id: user._id, role: user.role, isAdmin: true },
+    process.env.JWT_SECRET,
+    { expiresIn: '1d' }
+  );
+  res.header('Authorization', token).send({ token, user });
+});
+
+
+// Add this route in your backend (server.js)
+app.post('/api/admin/register', [
+  body('email').isEmail(),
+  body('password').isLength({ min: 6 }),
+  body('secretKey').equals(process.env.ADMIN_SECRET_KEY)
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    // Check if admin already exists
+    const adminExists = await User.findOne({ email: req.body.email, isAdmin: true });
+    if (adminExists) return res.status(400).send('Admin already exists');
+
+    const hashedPassword = await bcrypt.hash(req.body.password, 10);
+    const user = new User({
+      name: req.body.name,
+      email: req.body.email,
+      password: hashedPassword,
+      phone: req.body.phone,
+      isAdmin: true,
+      role: 'admin' // You might want to keep this for backward compatibility
+    });
+    
+    await user.save();
+    res.status(201).send('Admin created successfully');
+    
+  } catch (err) {
+    res.status(400).send(err.message);
+  }
+});
+// Regular user login remains the same
+// Add to server.js
+
+
+// Update the individual member report endpoint
+app.post('/api/reports/member', authenticate, async (req, res) => {
+  try {
+    const { month, year, memberId, contacted, feedback, isLeaderReport } = req.body;
+    const userId = req.user._id;
+    const group = req.user.group;  // Get group from authenticated user
+
+    // Validate input
+    if (!month || !year || !memberId) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Validate group exists
+    if (!group) {
+      return res.status(400).json({ message: 'User group is missing' });
+    }
+
+    // Find existing report or create new one
+    let report = await Report.findOne({ month, year, group });
+
+    if (!report) {
+      report = new Report({
+        month,
+        year,
+        group,  // Ensure group is set here
+        leaderReport: { leaderId: userId, contacts: [] },
+        deputyReport: { leaderId: userId, contacts: [] }
+      });
+    }
+
+    // Update the appropriate report
+    if (isLeaderReport) {
+      report.leaderReport.contacts = report.leaderReport.contacts.filter(
+        c => c.memberId.toString() !== memberId
+      );
+      report.leaderReport.contacts.push({ memberId, contacted, feedback });
+    } else {
+      report.deputyReport.contacts = report.deputyReport.contacts.filter(
+        c => c.memberId.toString() !== memberId
+      );
+      report.deputyReport.contacts.push({ memberId, contacted, feedback });
+    }
+
+    await report.save();
+    res.status(201).json(report);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+
+// Add this to your backend (server.js)
+app.post('/api/reports/member', authenticate, async (req, res) => {
+  try {
+    const { month, year, memberId, contacted, feedback, isLeaderReport } = req.body;
+    const userId = req.user._id;
+    const group = req.user.group;
+
+    // Find or create report for this month/year/group
+    let report = await Report.findOne({ month, year, group });
+    if (!report) {
+      report = new Report({
+        month,
+        year,
+        group,
+        leaderReport: { leaderId: userId, contacts: [] },
+        deputyReport: { leaderId: userId, contacts: [] }
+      });
+    }
+
+    // Update the appropriate report
+    if (isLeaderReport) {
+      // Remove existing contact if it exists
+      report.leaderReport.contacts = report.leaderReport.contacts.filter(
+        c => c.memberId.toString() !== memberId
+      );
+      
+      // Add new contact
+      report.leaderReport.contacts.push({ memberId, contacted, feedback });
+    } else {
+      // Remove existing contact if it exists
+      report.deputyReport.contacts = report.deputyReport.contacts.filter(
+        c => c.memberId.toString() !== memberId
+      );
+      
+      // Add new contact
+      report.deputyReport.contacts.push({ memberId, contacted, feedback });
+    }
+
+    await report.save();
+    res.status(201).json(report);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+app.get('/api/test', (req, res) => {
+  res.send('Server is running');
+});
 // Start server and seed data
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, async () => {
